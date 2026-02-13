@@ -1,0 +1,4 @@
+.venv
+binary
+__pycache__/
+*.o

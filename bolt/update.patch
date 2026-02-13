@@ -1,0 +1,1589 @@
+diff --git a/bolt/include/bolt/Core/BinaryFunction.h b/bolt/include/bolt/Core/BinaryFunction.h
+index 0b3682353f73..a6e1aae0fc9d 100644
+--- a/bolt/include/bolt/Core/BinaryFunction.h
++++ b/bolt/include/bolt/Core/BinaryFunction.h
+@@ -2358,6 +2358,13 @@ public:
+   bool isAArch64Veneer() const;
+ 
+   virtual ~BinaryFunction();
++
++  std::string getFileName(DILineInfoSpecifier::FileLineInfoKind FLIKind) const {
++    return BC.DwCtx->getLineInfoForAddress(
++      {getAddress(), getOriginSection()->getAddress()}, 
++      FLIKind
++    ).FileName;
++  }
+ };
+ 
+ inline raw_ostream &operator<<(raw_ostream &OS,
+diff --git a/bolt/include/bolt/Profile/ProfileYAMLMapping.h b/bolt/include/bolt/Profile/ProfileYAMLMapping.h
+index a8c9f7a10bbb..59418496f62b 100644
+--- a/bolt/include/bolt/Profile/ProfileYAMLMapping.h
++++ b/bolt/include/bolt/Profile/ProfileYAMLMapping.h
+@@ -202,6 +202,9 @@ namespace yaml {
+ namespace bolt {
+ struct BinaryFunctionProfile {
+   std::string Name;
++  #ifdef ADD_PATH
++  std::string Path; // Tawhid: Adding Path
++  #endif
+   uint32_t NumBasicBlocks{0};
+   uint32_t Id{0};
+   llvm::yaml::Hex64 Hash{0};
+@@ -215,6 +218,9 @@ struct BinaryFunctionProfile {
+ template <> struct MappingTraits<bolt::BinaryFunctionProfile> {
+   static void mapping(IO &YamlIO, bolt::BinaryFunctionProfile &BFP) {
+     YamlIO.mapRequired("name", BFP.Name);
++    #ifdef ADD_PATH
++    YamlIO.mapRequired("path", BFP.Path); // Tawhid: Adding Path
++    #endif
+     YamlIO.mapRequired("fid", BFP.Id);
+     YamlIO.mapRequired("hash", BFP.Hash);
+     YamlIO.mapRequired("exec", BFP.ExecCount);
+diff --git a/bolt/include/bolt/Profile/YAMLProfileReader.h b/bolt/include/bolt/Profile/YAMLProfileReader.h
+index 91f51f30e3ca..32315b127261 100644
+--- a/bolt/include/bolt/Profile/YAMLProfileReader.h
++++ b/bolt/include/bolt/Profile/YAMLProfileReader.h
+@@ -196,6 +196,16 @@ private:
+   // (YAML profile and its inline tree mapping to binary).
+   DenseMap<BinaryFunction *, std::vector<ProbeMatchSpec>> BFToProbeMatchSpecs;
+ 
++  // Function Mapping
++  StringMap<std::string> FnMap;
++
++  // Basic Block Mappings
++  StringMap<std::unordered_map<uint32_t, uint32_t>> BBMaps;
++  void readBBMaps(std::string FileName);
++  DenseMap<BinaryFunction *, std::vector<std::tuple<uint32_t, yaml::bolt::BinaryFunctionProfile*, uint32_t>>> BFCrossMaps;
++  void readBFCrossMaps(std::string FileName, BinaryContext &BC);
++
++
+   /// Populate \p Function profile with the one supplied in YAML format.
+   bool parseFunctionProfile(BinaryFunction &Function,
+                             const yaml::bolt::BinaryFunctionProfile &YamlBF);
+@@ -231,11 +241,17 @@ private:
+   /// Matches functions with similarly named profiled functions.
+   size_t matchWithNameSimilarity(BinaryContext &BC);
+ 
++  /// Matches unrecognized functions only: greedy
++  size_t matchUnrecognizedOnly(BinaryContext &BC);
++  /// Matches unrecognized functions only: sorted
++  size_t matchUnrecognizedOnly_v2(BinaryContext &BC);
++  
+   /// Update matched YAML -> BinaryFunction pair.
+   void matchProfileToFunction(yaml::bolt::BinaryFunctionProfile &YamlBF,
+                               BinaryFunction &BF) {
+     YamlProfileToFunction[YamlBF.Id] = &BF;
+     YamlBF.Used = true;
++    // outs() << "Tawhid-Match: " << YamlBF.Name << " " << BF.getPrintName() << '\n';
+ 
+     assert(!ProfiledFunctions.count(&BF) &&
+            "function already has an assigned profile");
+diff --git a/bolt/lib/Core/BinaryFunction.cpp b/bolt/lib/Core/BinaryFunction.cpp
+index 5da777411ba7..77cb8e01d540 100644
+--- a/bolt/lib/Core/BinaryFunction.cpp
++++ b/bolt/lib/Core/BinaryFunction.cpp
+@@ -2306,6 +2306,7 @@ Error BinaryFunction::buildCFG(MCPlusBuilder::AllocatorIdTy AllocatorId) {
+ 
+ void BinaryFunction::postProcessCFG() {
+   if (isSimple() && !BasicBlocks.empty()) {
++    // outs() << "Tawhid-PostProcess: " << getPrintName() << '\n';
+     // Convert conditional tail call branches to conditional branches that jump
+     // to a tail call.
+     removeConditionalTailCalls();
+diff --git a/bolt/lib/Passes/BinaryPasses.cpp b/bolt/lib/Passes/BinaryPasses.cpp
+index 03d3dd75a033..f151ec09e482 100644
+--- a/bolt/lib/Passes/BinaryPasses.cpp
++++ b/bolt/lib/Passes/BinaryPasses.cpp
+@@ -1406,6 +1406,7 @@ Error PrintProgramStats::runOnFunctions(BinaryContext &BC) {
+   std::vector<const BinaryFunction *> ProfiledFunctions;
+   std::vector<std::pair<double, uint64_t>> FuncDensityList;
+   const char *StaleFuncsHeader = "BOLT-INFO: Functions with stale profile:\n";
++  // uint64_t tawhid_stale_sample_count = 0;
+   for (auto &BFI : BC.getBinaryFunctions()) {
+     const BinaryFunction &Function = BFI.second;
+ 
+@@ -1453,6 +1454,9 @@ Error PrintProgramStats::runOnFunctions(BinaryContext &BC) {
+         InferredSampleCount += SampleCount;
+         ++NumAllStaleFunctions;
+       }
++      // else {
++      //   BC.outs() << "Tawhid-Info: func-uninferred " << Function << " " << SampleCount << '\n';
++      // }
+     } else {
+       if (opts::ReportStaleFuncs) {
+         BC.outs() << StaleFuncsHeader;
+@@ -1518,7 +1522,7 @@ Error PrintProgramStats::runOnFunctions(BinaryContext &BC) {
+                  " Use -report-stale to see the list.\n";
+     if (TotalSampleCount > 0) {
+       printErrorOrWarning();
+-      BC.errs() << (StaleSampleCount + InferredSampleCount) << " out of "
++      BC.errs() << StaleSampleCount << ", " << InferredSampleCount << " out of "
+                 << TotalSampleCount << " samples in the binary ("
+                 << format("%.1f",
+                           ((100.0f * (StaleSampleCount + InferredSampleCount)) /
+@@ -1543,6 +1547,7 @@ Error PrintProgramStats::runOnFunctions(BinaryContext &BC) {
+           Twine(opts::StaleThreshold.getValue()) + Twine("%. Exiting.\n"));
+     }
+   }
++  // BC.outs() << "Tawhid-Info: " << "function-not-inferred " << tawhid_stale_sample_count << "\n";
+   if (NumInferredFunctions) {
+     BC.outs() << format(
+         "BOLT-INFO: inferred profile for %d (%.2f%% of profiled, "
+diff --git a/bolt/lib/Passes/CacheMetrics.cpp b/bolt/lib/Passes/CacheMetrics.cpp
+index 21b420a5c2b0..58d5ffc5b2f8 100644
+--- a/bolt/lib/Passes/CacheMetrics.cpp
++++ b/bolt/lib/Passes/CacheMetrics.cpp
+@@ -80,8 +80,14 @@ calcTSPScore(const std::vector<BinaryFunction *> &BinaryFunctions,
+           assert(BBAddrIt != BBAddr.end());
+           uint64_t DstBBAddr = BBAddrIt->second;
+ 
+-          if (SrcBBAddr + SrcBBSize == DstBBAddr)
++          if (SrcBBAddr + SrcBBSize == DstBBAddr) {
+             Score += BI->Count;
++            outs() << "Tawhid-TSPEdge: " 
++            << SrcBB->getFunction()->getPrintName() << '#' << SrcBB->getIndex() << ' ' 
++            << DstBB->getFunction()->getPrintName() << '#' << DstBB->getIndex() << ' ' 
++            << BI->Count << ' ' 
++            << SrcBBAddr << ' ' << SrcBBSize << ' ' << DstBBAddr << '\n';
++          }
+         }
+         ++BI;
+       }
+diff --git a/bolt/lib/Passes/SplitFunctions.cpp b/bolt/lib/Passes/SplitFunctions.cpp
+index bd0b6dea0e06..ca138bf519d3 100644
+--- a/bolt/lib/Passes/SplitFunctions.cpp
++++ b/bolt/lib/Passes/SplitFunctions.cpp
+@@ -27,6 +27,8 @@
+ #include <numeric>
+ #include <random>
+ #include <vector>
++#include <string>
++#include <fstream>
+ 
+ #define DEBUG_TYPE "bolt-opts"
+ 
+@@ -123,6 +125,11 @@ static cl::opt<double>
+     JumpPower("jump-power",
+               cl::desc("Jump score power (when --split-strategy=cdsplit)"),
+               cl::init(0.15), cl::ReallyHidden, cl::cat(BoltOptCategory));
++
++static cl::opt<std::string> SplitSkipsFileName("split-skips-file-name",
++    cl::desc("<csv file of functions to skip splitting>"),
++    cl::Optional, cl::init(""),
++    cl::cat(BoltOptCategory));
+ } // namespace opts
+ 
+ namespace {
+@@ -711,6 +718,40 @@ bool SplitFunctions::shouldOptimize(const BinaryFunction &BF) const {
+   return BinaryFunctionPass::shouldOptimize(BF);
+ }
+ 
++DenseSet<BinaryFunction *> readSkipBFs(std::string FileName, BinaryContext &BC) {
++  DenseSet<BinaryFunction *> BFSet;
++
++  if (FileName.size() == 0)
++    return BFSet;
++
++  // Open the file
++  std::ifstream File(FileName, std::ios::in);
++  if (!File.is_open()) {
++    outs() << "Error: Could not open the file " << FileName << '\n';
++    return BFSet;
++  }
++
++  StringMap<BinaryFunction *> NameToBF;
++  for (auto BF: BC.getAllBinaryFunctions()) {
++    for (auto Name: BF->getNames()) {
++      NameToBF[Name] = BF;
++    }
++  }
++
++  // Read the file line by line
++  std::string BFName;
++  while (std::getline(File, BFName)) {
++    if (!NameToBF.contains(BFName))
++      continue;
++    BFSet.insert(NameToBF[BFName]);
++  }
++
++  // Close the file
++  File.close();
++
++  return BFSet;
++}
++
+ Error SplitFunctions::runOnFunctions(BinaryContext &BC) {
+   if (!opts::SplitFunctions)
+     return Error::success();
+@@ -761,8 +802,10 @@ Error SplitFunctions::runOnFunctions(BinaryContext &BC) {
+     break;
+   }
+ 
++  auto SkipBFs = readSkipBFs(opts::SplitSkipsFileName, BC);
++
+   ParallelUtilities::PredicateTy SkipFunc = [&](const BinaryFunction &BF) {
+-    return !shouldOptimize(BF);
++    return SkipBFs.contains(&BF) || !shouldOptimize(BF);
+   };
+ 
+   ParallelUtilities::runOnEachFunction(
+diff --git a/bolt/lib/Profile/DataAggregator.cpp b/bolt/lib/Profile/DataAggregator.cpp
+index 697cac9fbcaa..17776c151e56 100644
+--- a/bolt/lib/Profile/DataAggregator.cpp
++++ b/bolt/lib/Profile/DataAggregator.cpp
+@@ -2404,6 +2404,9 @@ std::error_code DataAggregator::writeBATYAML(BinaryContext &BC,
+       BinaryFunction *BF = BC.getBinaryFunctionAtAddress(FuncAddress);
+       assert(BF);
+       YamlBF.Name = getLocationName(*BF, BAT);
++      #ifdef ADD_PATH
++      YamlBF.Path = BF->getFileName(llvm::DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath); // Tawhid: Adding Path
++      #endif
+       YamlBF.Id = BF->getFunctionNumber();
+       YamlBF.Hash = BAT->getBFHash(FuncAddress);
+       YamlBF.ExecCount = BF->getKnownExecutionCount();
+diff --git a/bolt/lib/Profile/StaleProfileMatching.cpp b/bolt/lib/Profile/StaleProfileMatching.cpp
+index b66a3f478f1a..426755b427ee 100644
+--- a/bolt/lib/Profile/StaleProfileMatching.cpp
++++ b/bolt/lib/Profile/StaleProfileMatching.cpp
+@@ -45,6 +45,8 @@ using namespace llvm;
+ namespace opts {
+ 
+ extern cl::opt<bool> TimeRewrite;
++extern cl::opt<bool> UniqueBBMap;
++extern cl::opt<bool> PrintInfo;
+ extern cl::OptionCategory BoltOptCategory;
+ 
+ cl::opt<bool>
+@@ -225,7 +227,8 @@ public:
+     MATCH_PROBE_LOOSE,
+     MATCH_OPCODE,
+     MATCH_CALL,
+-    NO_MATCH
++    NO_MATCH,
++    MATCH_SOURCE
+   };
+ 
+   /// Find the most similar flow block for a profile block given blended hash.
+@@ -567,7 +570,9 @@ size_t matchWeights(
+     const yaml::bolt::BinaryFunctionProfile &YamlBF, FlowFunction &Func,
+     HashFunction HashFunction, YAMLProfileReader::ProfileLookupMap &IdToYamlBF,
+     const BinaryFunction &BF,
+-    const ArrayRef<YAMLProfileReader::ProbeMatchSpec> ProbeMatchSpecs) {
++    const ArrayRef<YAMLProfileReader::ProbeMatchSpec> ProbeMatchSpecs,
++    std::unordered_map<uint32_t, uint32_t> *BBMap,
++    std::vector<std::tuple<uint32_t, yaml::bolt::BinaryFunctionProfile*, uint32_t>> *BFCrossMap) {
+ 
+   assert(Func.Blocks.size() == BlockOrder.size() + 2);
+ 
+@@ -630,27 +635,54 @@ size_t matchWeights(
+         if (!MatchedBlock)
+           return;
+         // Don't override earlier matches
+-        if (MatchedFlowBlocks.contains(MatchedBlock))
++        if (MatchedFlowBlocks.contains(MatchedBlock) || (opts::UniqueBBMap && MatchedBlocks[&YamlBP].contains(YamlBB.Index)))
+           return;
++        if(opts::PrintInfo) 
++          outs() << "Tawhid-MapBB: " 
++          << YamlBP.Name << ' ' << YamlBB.Index << ' '
++          << BF.getPrintName() << ' ' << MatchedBlock->Index - 1 << '\n';
+         MatchedFlowBlocks.try_emplace(MatchedBlock, Method);
+         MatchedBlocks[&YamlBP][YamlBB.Index] = {MatchedBlock, &YamlBB};
+       };
+ 
++  // Match blocks from the profile to the blocks in CFG by known mapping.
++  if (BBMap != nullptr) for (const yaml::bolt::BinaryBasicBlockProfile &YamlBB : YamlBF.Blocks) {
++    auto It = BBMap->find(YamlBB.Index);
++    if (It == BBMap->end())
++      continue;
++    // if (It->second >= Blocks.size())
++    //   outs() << "Tawhid-Debug: " << YamlBF.Name << ' ' << 
++    //   YamlBB.Index << ' ' <<
++    //   BF.getPrintName() << ' ' <<
++    //   It->second << ' ' << 
++    //   Blocks.size() << '\n';
++    // assert(It->second < Blocks.size());
++    if (It->second == -1 || It->second >= Blocks.size()) continue;
++    addMatchedBlock({Blocks[It->second], StaleMatcher::MATCH_SOURCE}, YamlBF, YamlBB);
++  }
++
+   // Match blocks from the profile to the blocks in CFG by strict hash.
+   for (const yaml::bolt::BinaryBasicBlockProfile &YamlBB : YamlBF.Blocks) {
+     // Update matching stats.
+     ++BC.Stats.NumStaleBlocks;
+     BC.Stats.StaleSampleCount += YamlBB.ExecCount;
++    
++    uint32_t ExecCount = 0;
++    for (auto &Succ: YamlBB.Successors)
++      ExecCount += Succ.Count;
++    // outs() << "Tawhid-YamlBB: " << YamlBF.Name << ' ' << YamlBB.Index << ' ' << ExecCount << '\n';
+ 
+     assert(YamlBB.Hash != 0 && "empty hash of BinaryBasicBlockProfile");
+     BlendedBlockHash YamlHash(YamlBB.Hash);
+-    addMatchedBlock(Matcher.matchBlockStrict(YamlHash), YamlBF, YamlBB);
++    if (BBMap == nullptr || BBMap->find(YamlBB.Index) == BBMap->end())
++      addMatchedBlock(Matcher.matchBlockStrict(YamlHash), YamlBF, YamlBB);
+   }
+   // Match blocks from the profile to the blocks in CFG by pseudo probes.
+   for (const auto &[InlineNodeMap, YamlBP] : ProbeMatchSpecs) {
+     for (const yaml::bolt::BinaryBasicBlockProfile &BB : YamlBP.get().Blocks)
+       if (!BB.PseudoProbes.empty())
+-        addMatchedBlock(Matcher.matchBlockProbe(BB.PseudoProbes, InlineNodeMap),
++        if (BBMap == nullptr || BBMap->find(BB.Index) == BBMap->end())
++          addMatchedBlock(Matcher.matchBlockProbe(BB.PseudoProbes, InlineNodeMap),
+                         YamlBP, BB);
+   }
+   // Match blocks from the profile to the blocks in CFG with loose methods.
+@@ -680,12 +712,14 @@ size_t matchWeights(
+                         << "\n");
+       continue;
+     }
+-    addMatchedBlock({MatchedBlock, Method}, YamlBF, YamlBB);
++    if (BBMap == nullptr || BBMap->find(YamlBB.Index) == BBMap->end())
++      addMatchedBlock({MatchedBlock, Method}, YamlBF, YamlBB);
+   }
+ 
+   // Match jumps from the profile to the jumps from CFG
+   std::vector<uint64_t> OutWeight(Func.Blocks.size(), 0);
+   std::vector<uint64_t> InWeight(Func.Blocks.size(), 0);
++  // uint64_t tawhid_not_matched = 0;
+ 
+   for (const auto &[YamlBF, MatchMap] : MatchedBlocks) {
+     for (const auto &[YamlBBIdx, FlowBlockProfile] : MatchMap) {
+@@ -727,6 +761,7 @@ size_t matchWeights(
+         LLVM_DEBUG(dbgs() << "  loose match\n");
+         break;
+       case StaleMatcher::NO_MATCH:
++        // tawhid_not_matched += ExecCount;
+         LLVM_DEBUG(dbgs() << "  no match\n");
+       }
+     }
+@@ -768,6 +803,52 @@ size_t matchWeights(
+       }
+     }
+   }
++  // BC.outs() << "\nTawhid-Info: " << tawhid_not_matched << '\n';
++  auto MainCount = YamlBF.ExecCount;
++  auto ScaleCount = [MainCount](uint64_t BBCount, uint64_t BFCount) {
++    // return (BBCount * (MainCount + 1) + (BFCount + 1) / 2) / (BFCount + 1);
++    return BBCount;
++  };
++  DenseMap<yaml::bolt::BinaryFunctionProfile *, DenseMap<uint32_t, uint32_t>> CrossMatchMaps;
++  if (BFCrossMap != nullptr) for (auto &[BBIndex, YamlBF, YamlBBIndex]: *BFCrossMap) {
++    CrossMatchMaps[YamlBF][YamlBBIndex] = BBIndex;
++  }
++  for (auto &[YamlBF, CrossMatchMap]: CrossMatchMaps) {
++    for (auto &YamlBB: YamlBF->Blocks) {
++      const FlowBlock *MatchedSrcBlock = CrossMatchMap.contains(YamlBB.Index)? 
++        Blocks[CrossMatchMap[YamlBB.Index]]: nullptr;
++      for (auto YamlSI: YamlBB.Successors) {
++        auto Count = ScaleCount(YamlSI.Count, YamlBF->ExecCount);
++
++        if (Count == 0)
++          continue;
++        
++        const FlowBlock *MatchedDstBlock = CrossMatchMap.contains(YamlSI.Index)? 
++          Blocks[CrossMatchMap[YamlSI.Index]]: nullptr;
++        if (MatchedSrcBlock != nullptr && MatchedDstBlock != nullptr) {
++          // Find a jump between the two blocks
++          FlowJump *Jump = nullptr;
++          for (FlowJump *SuccJump : MatchedSrcBlock->SuccJumps) {
++            if (SuccJump->Target == MatchedDstBlock->Index) {
++              Jump = SuccJump;
++              break;
++            }
++          }
++          // Assign the weight, if the corresponding jump is found
++          if (Jump != nullptr) {
++            Jump->Weight = Count;
++            Jump->HasUnknownWeight = false;
++          }
++        }
++        // Assign the weight for the src block, if it is found
++        if (MatchedSrcBlock != nullptr)
++          OutWeight[MatchedSrcBlock->Index] += Count;
++        // Assign the weight for the dst block, if it is found
++        if (MatchedDstBlock != nullptr)
++          InWeight[MatchedDstBlock->Index] += Count;
++      }
++    }
++  }
+ 
+   // Assign block counts based on in-/out- jumps
+   for (FlowBlock &Block : Func.Blocks) {
+@@ -1021,9 +1102,11 @@ bool YAMLProfileReader::inferStaleProfile(
+   FlowFunction Func = createFlowFunction(BlockOrder);
+ 
+   // Match as many block/jump counts from the stale profile as possible
++  auto BBMap = BBMaps.contains(YamlBF.Name)? &BBMaps[YamlBF.Name]: nullptr;
++  auto BFCrossMap = BFCrossMaps.contains(&BF)? &BFCrossMaps[&BF]: nullptr;
+   size_t MatchedBlocks =
+       matchWeights(BF.getBinaryContext(), BlockOrder, YamlBF, Func,
+-                   YamlBP.Header.HashFunction, IdToYamLBF, BF, ProbeMatchSpecs);
++                   YamlBP.Header.HashFunction, IdToYamLBF, BF, ProbeMatchSpecs, BBMap, BFCrossMap);
+ 
+   // Adjust the flow function by marking unreachable blocks Unlikely so that
+   // they don't get any counts assigned.
+diff --git a/bolt/lib/Profile/YAMLProfileReader.cpp b/bolt/lib/Profile/YAMLProfileReader.cpp
+index e3872b373f41..a18840d10381 100644
+--- a/bolt/lib/Profile/YAMLProfileReader.cpp
++++ b/bolt/lib/Profile/YAMLProfileReader.cpp
+@@ -18,9 +18,17 @@
+ #include "llvm/Demangle/Demangle.h"
+ #include "llvm/MC/MCPseudoProbe.h"
+ #include "llvm/Support/CommandLine.h"
++#include <fstream>
++#include <sstream>
++#include <vector>
++#include <queue>
++#include <tuple>
++#include <climits>
+ 
+ using namespace llvm;
+ 
++const std::string CHECK_NAME = "_ZN5mongo14future_details12throwingCallIZNS_12_GLOBAL__N_132RunCommandAndWaitForWriteConcern8_runImplEvEUlNS_6StatusEE_JNS_10StatusWithINS0_8FakeVoidEEEEEEDaOT_DpOT0_.lto_priv.0/1";
++
+ namespace opts {
+ 
+ extern cl::opt<unsigned> Verbosity;
+@@ -28,6 +36,56 @@ extern cl::OptionCategory BoltOptCategory;
+ extern cl::opt<bool> InferStaleProfile;
+ extern cl::opt<bool> Lite;
+ 
++cl::opt<std::string> OldDebugInfoFileName("old-debug-info-file-name",
++  cl::desc("<debug info csv file for the old binary>"),
++  cl::Optional, cl::init(""),
++  cl::cat(BoltOptCategory));
++
++cl::opt<std::string> NewDebugInfoFileName("new-debug-info-file-name",
++  cl::desc("<debug info csv file for the new binary>"),
++  cl::Optional, cl::init(""),
++  cl::cat(BoltOptCategory));
++
++cl::opt<bool> IgnoreMissingprofile("ignore-missing-profile",
++  cl::desc("<whether to ignore bolting the functions with missing profile>"),
++  cl::Optional, cl::init(false),
++  cl::cat(BoltOptCategory));
++
++cl::opt<bool> SortedMatchUnrecognized("sorted-match-unrecognized",
++  cl::desc("<whether to use sorting for matching unrecognized functions>"),
++  cl::Optional, cl::init(false),
++  cl::cat(BoltOptCategory));
++
++cl::opt<std::string> FnMapFileName("fn-map-file-name",
++  cl::desc("<csv file for function mapping>"),
++  cl::Optional, cl::init(""),
++  cl::cat(BoltOptCategory));
++
++cl::opt<std::string> BBMapFileName("bb-map-file-name",
++  cl::desc("<csv file for basic block mapping>"),
++  cl::Optional, cl::init(""),
++  cl::cat(BoltOptCategory));
++
++cl::opt<std::string> BFCrossMapFileName("bb-cross-file-name",
++  cl::desc("<csv file for basic block mapping outside of function maps>"),
++  cl::Optional, cl::init(""),
++  cl::cat(BoltOptCategory));
++
++cl::opt<bool> UniqueBBMap("unique-bb-map",
++  cl::desc("<whether to make basic block mapping one to one>"),
++  cl::Optional, cl::init(false),
++  cl::cat(BoltOptCategory));
++
++cl::opt<bool> PrintInfo("print-info",
++  cl::desc("<whether to print information during processing>"),
++  cl::Optional, cl::init(false),
++  cl::cat(BoltOptCategory));
++
++cl::opt<bool> PrintNess("print-ness",
++  cl::desc("<whether to print information about basic-blocks' hot/cold-ness>"),
++  cl::Optional, cl::init(false),
++  cl::cat(BoltOptCategory));
++
+ cl::opt<unsigned> NameSimilarityFunctionMatchingThreshold(
+     "name-similarity-function-matching-threshold",
+     cl::desc("Match functions using namespace and edit distance"), cl::init(0),
+@@ -130,6 +188,31 @@ bool YAMLProfileReader::isYAML(const StringRef Filename) {
+   return false;
+ }
+ 
++void readFnMap(std::string FileName, StringMap<std::string>& FnMap) {
++    // Open the file
++    std::ifstream File(FileName, std::ios::in);
++    if (!File.is_open()) {
++        outs() << "Error: Could not open the file " << FileName << '\n';
++        return;
++    }
++
++    // Read the file line by line
++    std::string Line;
++    while (std::getline(File, Line)) {
++        std::stringstream SS(Line);
++        std::string YamlBFName, BFName;
++        
++        if (std::getline(SS, YamlBFName, ',') && std::getline(SS, BFName)) {
++            FnMap[YamlBFName] = BFName;
++        } else {
++            outs() << "Error: Could not parse line " << Line << '\n';
++        }
++    }
++
++    // Close the file
++    File.close();
++}
++
+ void YAMLProfileReader::buildNameMaps(BinaryContext &BC) {
+   auto lookupFunction = [&](StringRef Name) -> BinaryFunction * {
+     if (BinaryData *BD = BC.getBinaryDataByName(Name))
+@@ -139,8 +222,13 @@ void YAMLProfileReader::buildNameMaps(BinaryContext &BC) {
+ 
+   ProfileBFs.reserve(YamlBP.Functions.size());
+ 
++  if (opts::FnMapFileName.size() > 0)
++    readFnMap(opts::FnMapFileName, FnMap);
++
+   for (yaml::bolt::BinaryFunctionProfile &YamlBF : YamlBP.Functions) {
+     StringRef Name = YamlBF.Name;
++    if (FnMap.contains(Name))
++      Name = FnMap[Name];
+     const size_t Pos = Name.find("(*");
+     if (Pos != StringRef::npos)
+       Name = Name.substr(0, Pos);
+@@ -149,11 +237,20 @@ void YAMLProfileReader::buildNameMaps(BinaryContext &BC) {
+     if (const std::optional<StringRef> CommonName = getLTOCommonName(Name))
+       LTOCommonNameMap[*CommonName].push_back(&YamlBF);
+   }
+-  for (auto &[Symbol, BF] : BC.SymbolToFunctionMap) {
+-    StringRef Name = Symbol->getName();
+-    if (const std::optional<StringRef> CommonName = getLTOCommonName(Name))
+-      LTOCommonNameFunctionMap[*CommonName].insert(BF);
++  FnMap.clear();
++  
++  for (const auto BF: BC.getAllBinaryFunctions()) {
++    for (const auto& Name: BF->getNames()) {
++      if (const std::optional<StringRef> CommonName = getLTOCommonName(Name))
++        if (LTOCommonNameMap.contains(*CommonName))
++          LTOCommonNameFunctionMap[*CommonName].insert(BF);
++    }
+   }
++  // for (auto &[Symbol, BF] : BC.SymbolToFunctionMap) {
++  //   StringRef Name = Symbol->getName();
++  //   if (const std::optional<StringRef> CommonName = getLTOCommonName(Name))
++  //     LTOCommonNameFunctionMap[*CommonName].insert(BF);
++  // }
+ }
+ 
+ bool YAMLProfileReader::hasLocalsWithFileName() const {
+@@ -183,8 +280,10 @@ bool YAMLProfileReader::parseFunctionProfile(
+       FuncRawBranchCount += YamlSI.Count;
+   BF.setRawBranchCount(FuncRawBranchCount);
+ 
+-  if (BF.empty())
++  if (BF.empty()) {
++    outs() << "Tawhid-Parse: " << BF.getPrintName() << ' ' << 1 << '\n';
+     return true;
++  }
+ 
+   if (!opts::IgnoreHash) {
+     if (!BF.getHash())
+@@ -352,13 +451,18 @@ bool YAMLProfileReader::parseFunctionProfile(
+     if (YamlBF.NumBasicBlocks != BF.size())
+       ++BC.Stats.NumStaleFuncsWithEqualBlockCount;
+ 
+-    if (!opts::InferStaleProfile)
++    if (!opts::InferStaleProfile) {
++      outs() << "Tawhid-Parse: " << BF.getPrintName() << ' ' << 2 << '\n';
+       return false;
++    }
+     ArrayRef<ProbeMatchSpec> ProbeMatchSpecs;
+     auto BFIt = BFToProbeMatchSpecs.find(&BF);
+     if (BFIt != BFToProbeMatchSpecs.end())
+       ProbeMatchSpecs = BFIt->second;
+     ProfileMatched = inferStaleProfile(BF, YamlBF, ProbeMatchSpecs);
++    outs() << "Tawhid-Parse: " << BF.getPrintName() << ' ' << 4 + ProfileMatched << '\n';
++  } else {
++    outs() << "Tawhid-Parse: " << BF.getPrintName() << ' ' << 3 << '\n';
+   }
+   if (ProfileMatched)
+     BF.markProfiled(YamlBP.Header.Flags);
+@@ -424,7 +528,7 @@ bool YAMLProfileReader::profileMatches(
+ }
+ 
+ bool YAMLProfileReader::mayHaveProfileData(const BinaryFunction &BF) {
+-  if (opts::MatchProfileWithFunctionHash || opts::MatchWithCallGraph)
++  if (opts::MatchProfileWithFunctionHash || opts::MatchWithCallGraph || opts::NameSimilarityFunctionMatchingThreshold > 0 || opts::OldDebugInfoFileName.size() > 0)
+     return true;
+   for (StringRef Name : BF.getNames())
+     if (ProfileFunctionNames.contains(Name))
+@@ -440,6 +544,7 @@ bool YAMLProfileReader::mayHaveProfileData(const BinaryFunction &BF) {
+ }
+ 
+ size_t YAMLProfileReader::matchWithExactName() {
++  // outs() << "Tawhid-Call: matchWithExactName is called" << '\n';
+   size_t MatchedWithExactName = 0;
+   // This first pass assigns profiles that match 100% by name and by hash.
+   for (auto [YamlBF, BF] : llvm::zip_equal(YamlBP.Functions, ProfileBFs)) {
+@@ -451,6 +556,7 @@ size_t YAMLProfileReader::matchWithExactName() {
+     Function.setExecutionCount(BinaryFunction::COUNT_NO_PROFILE);
+ 
+     if (profileMatches(YamlBF, Function)) {
++      outs() << "Tawhid-Map-Exact: " << YamlBF.Name << ' ' << Function.getPrintName() << '\n';
+       matchProfileToFunction(YamlBF, Function);
+       ++MatchedWithExactName;
+     }
+@@ -464,6 +570,7 @@ size_t YAMLProfileReader::matchWithHash(BinaryContext &BC) {
+   // Collisions are possible where multiple functions share the same exact hash.
+   size_t MatchedWithHash = 0;
+   if (opts::MatchProfileWithFunctionHash) {
++    // outs() << "Tawhid-Call: matchWithHash is called" << '\n';
+     DenseMap<size_t, BinaryFunction *> StrictHashToBF;
+     StrictHashToBF.reserve(BC.getBinaryFunctions().size());
+ 
+@@ -476,6 +583,7 @@ size_t YAMLProfileReader::matchWithHash(BinaryContext &BC) {
+       auto It = StrictHashToBF.find(YamlBF.Hash);
+       if (It != StrictHashToBF.end() && !ProfiledFunctions.count(It->second)) {
+         BinaryFunction *BF = It->second;
++        outs() << "Tawhid-Map-Hash: " << YamlBF.Name << ' ' << BF->getPrintName() << '\n';
+         matchProfileToFunction(YamlBF, *BF);
+         ++MatchedWithHash;
+       }
+@@ -485,6 +593,7 @@ size_t YAMLProfileReader::matchWithHash(BinaryContext &BC) {
+ }
+ 
+ size_t YAMLProfileReader::matchWithLTOCommonName() {
++  // outs() << "Tawhid-Call: matchWithLTOCommonName is called" << '\n';
+   // This second pass allows name ambiguity for LTO private functions.
+   size_t MatchedWithLTOCommonName = 0;
+   for (const auto &[CommonName, LTOProfiles] : LTOCommonNameMap) {
+@@ -499,6 +608,7 @@ size_t YAMLProfileReader::matchWithLTOCommonName() {
+         return false;
+       for (BinaryFunction *BF : Functions) {
+         if (!ProfiledFunctions.count(BF) && profileMatches(*YamlBF, *BF)) {
++          outs() << "Tawhid-Map-LTO: " << YamlBF->Name << ' ' << BF->getPrintName() << '\n';
+           matchProfileToFunction(*YamlBF, *BF);
+           ++MatchedWithLTOCommonName;
+           return true;
+@@ -513,6 +623,7 @@ size_t YAMLProfileReader::matchWithLTOCommonName() {
+     if (!ProfileMatched && LTOProfiles.size() == 1 && Functions.size() == 1 &&
+         !LTOProfiles.front()->Used &&
+         !ProfiledFunctions.count(*Functions.begin())) {
++      outs() << "Tawhid-Map-LTO: " << LTOProfiles.front()->Name << ' ' << (**Functions.begin()).getPrintName() << '\n';
+       matchProfileToFunction(*LTOProfiles.front(), **Functions.begin());
+       ++MatchedWithLTOCommonName;
+     }
+@@ -523,7 +634,7 @@ size_t YAMLProfileReader::matchWithLTOCommonName() {
+ size_t YAMLProfileReader::matchWithCallGraph(BinaryContext &BC) {
+   if (!opts::MatchWithCallGraph)
+     return 0;
+-
++  // outs() << "Tawhid-Call: matchWithCallGraph is called" << '\n';
+   size_t MatchedWithCallGraph = 0;
+   CallGraphMatcher CGMatcher(BC, YamlBP, IdToYamLBF);
+ 
+@@ -585,6 +696,7 @@ size_t YAMLProfileReader::matchWithCallGraph(BinaryContext &BC) {
+       }
+     }
+     if (ClosestBF) {
++      outs() << "Tawhid-Map-Graph: " << YamlBF.Name << ' ' << ClosestBF->getPrintName() << '\n';
+       matchProfileToFunction(YamlBF, *ClosestBF);
+       ++MatchedWithCallGraph;
+     }
+@@ -651,6 +763,7 @@ decodeYamlInlineTree(const yaml::bolt::ProfilePseudoProbeDesc &YamlPD,
+ size_t YAMLProfileReader::matchWithPseudoProbes(BinaryContext &BC) {
+   if (!opts::StaleMatchingWithPseudoProbes)
+     return 0;
++  // outs() << "Tawhid-Call: matchWithPseudoProbes is called" << '\n';
+ 
+   const MCPseudoProbeDecoder *Decoder = BC.getPseudoProbeDecoder();
+   const yaml::bolt::ProfilePseudoProbeDesc &YamlPD = YamlBP.PseudoProbeDesc;
+@@ -691,6 +804,7 @@ size_t YAMLProfileReader::matchWithPseudoProbes(BinaryContext &BC) {
+ size_t YAMLProfileReader::matchWithNameSimilarity(BinaryContext &BC) {
+   if (opts::NameSimilarityFunctionMatchingThreshold == 0)
+     return 0;
++  // outs() << "Tawhid-Call: matchWithNameSimilarity is called" << '\n';
+ 
+   size_t MatchedWithNameSimilarity = 0;
+   ItaniumPartialDemangler Demangler;
+@@ -747,6 +861,8 @@ size_t YAMLProfileReader::matchWithNameSimilarity(BinaryContext &BC) {
+     NamespaceToBFs[Namespace].push_back(BF);
+   }
+ 
++  std::unordered_map<BinaryFunction*, std::string> BFDemangledNames;
++
+   // Iterates through all profiled functions and binary functions belonging to
+   // the same namespace and matches based on edit distance threshold.
+   assert(YamlBP.Functions.size() == ProfiledBFNamespaces.size() &&
+@@ -771,19 +887,30 @@ size_t YAMLProfileReader::matchWithNameSimilarity(BinaryContext &BC) {
+     for (BinaryFunction *BF : BFs) {
+       if (ProfiledFunctions.count(BF))
+         continue;
+-      if (BF->size() != YamlBF.NumBasicBlocks)
+-        continue;
+-      std::string BFDemangledName = BF->getDemangledName();
++      // if (BF->size() != YamlBF.NumBasicBlocks)
++      //   continue;
++      std::string BFDemangledName;
++      if (BFDemangledNames.count(BF)) {
++        BFDemangledName = BFDemangledNames[BF];
++      } else {
++        BFDemangledName = BF->getDemangledName();
++        BFDemangledNames[BF] = BFDemangledName;
++      }
+       unsigned BFEditDistance =
+           StringRef(BFDemangledName).edit_distance(YamlBFDemangledName);
+       if (BFEditDistance < MinEditDistance) {
+         MinEditDistance = BFEditDistance;
+         ClosestNameBF = BF;
+       }
++    //   outs() << "Tawhid-EditDistance: " 
++    //   << YamlBF.Name << '#' << YamlBFDemangledName << '#' 
++    //   << BF->getPrintName() << '#' << BFDemangledName << '#' 
++    //   << BFEditDistance<< '\n';
+     }
+ 
+     if (ClosestNameBF &&
+         MinEditDistance <= opts::NameSimilarityFunctionMatchingThreshold) {
++      outs() << "Tawhid-Map-NameSimilarity: " << YamlBF.Name << ' ' << ClosestNameBF->getPrintName() << '\n';
+       matchProfileToFunction(YamlBF, *ClosestNameBF);
+       ++MatchedWithNameSimilarity;
+     }
+@@ -792,6 +919,527 @@ size_t YAMLProfileReader::matchWithNameSimilarity(BinaryContext &BC) {
+   return MatchedWithNameSimilarity;
+ }
+ 
++std::unordered_map<std::string, std::pair<std::string, int>> readFuncLocs(std::string FileName) {
++  std::unordered_map<std::string, std::pair<std::string, int>> FuncLocs;
++  // Open the file
++  std::ifstream File(FileName, std::ios::in);
++  if (!File.is_open()) {
++    outs() << "Error: Could not open the file " << FileName << '\n';
++    return FuncLocs;
++  }
++
++  // Read the file line by line
++  std::string Line;
++  while (std::getline(File, Line)) {
++    std::istringstream SS(Line);
++    std::string FilePath, LineNum, FuncName;
++
++    // Parse the two columns from the line
++    if (
++      std::getline(SS, FilePath, ',') && 
++      std::getline(SS, LineNum, ',') && 
++      std::getline(SS, FuncName, ',') &&
++      std::all_of(LineNum.begin(), LineNum.end(), ::isdigit)
++    ) {
++      FuncLocs[FuncName] = std::make_pair(FilePath, std::stoi(LineNum));
++    }
++  }
++
++  // Close the file
++  File.close();
++
++  return FuncLocs;
++}
++
++size_t YAMLProfileReader::matchUnrecognizedOnly(BinaryContext &BC) {
++  if (opts::OldDebugInfoFileName.size() == 0)
++    return 0;
++  /*
++  struct TrieNode {
++    std::string label;
++    TrieNode* children[128];
++    BinaryFunction* bf;
++
++    TrieNode(std::string label, BinaryFunction* bf): label(label), bf(bf) {
++      memset(children, 0, sizeof(children));
++    }
++  };
++
++  auto insertBF = [](TrieNode* root, std::string str, BinaryFunction* bf) -> TrieNode* {
++    if (root == nullptr)
++      return new TrieNode(str, bf);
++    size_t i = 0;
++    std::string org = str;
++    TrieNode* node = root;
++    TrieNode** node_loc = nullptr;
++    // if (org.find("check") == 0) {
++    //   outs() << "Tawhid-InsertBF: " << org << '\n';
++    // }
++    // if (org.find("check") == 0) {
++    //   outs() << "Tawhid-InsertBF-node: " << node->label << '\n';
++    // }
++    while (i < str.size()) {
++      // if (org.find("check") == 0) {
++      //   outs() << "Tawhid-InsertBF-iter: " << i << ' ' << str[i] << '\n';
++      // }
++      if (str[i] != node->label[i] || i >= node->label.size()) {
++        auto next_loc = &node->children[(size_t) str[i]];
++        if (*next_loc == nullptr)
++          break;
++        node_loc = next_loc;
++        node = *next_loc;
++        // if (org.find("check") == 0) {
++        //   outs() << "Tawhid-InsertBF-node: " << node->label << '\n';
++        // }
++        str = str.substr(i + 1);
++        i = 0;
++      } else {
++        i++;
++      }
++    }
++    if (i == str.size()) {
++      if (i == node->label.size()) {
++        // if (org.find("check") == 0) {
++        //   outs() << "Tawhid-InsertBF-option-1: " << i << '\n';
++        // }
++        node->bf = bf;
++      } else {
++        // if (org.find("check") == 0) {
++        //   outs() << "Tawhid-InsertBF-option-2: " << i << ' ' << str << ' ' << node->label << '\n';
++        // }
++        auto prev = new TrieNode(str, bf);
++        prev->children[(size_t) node->label[i]] = node;
++        node->label = node->label.substr(i + 1);
++        if (node_loc)
++          *node_loc = prev;
++        if (root == node)
++          root = prev;
++      }
++    } else {
++      if (i == node->label.size()) {
++        // if (org.find("check") == 0) {
++        //   outs() << "Tawhid-InsertBF-option-3: " << i << ' ' << str << ' ' << node->label << '\n';
++        // }
++        auto next = new TrieNode(str.substr(i + 1), bf);
++        node->children[(size_t) str[i]] = next;
++      } else {
++        // if (org.find("check") == 0) {
++        //   outs() << "Tawhid-InsertBF-option-4: " << i << ' ' << str << ' ' << node->label << '\n';
++        // }
++        auto prev = new TrieNode(str.substr(0, i), nullptr);
++        prev->children[(size_t) node->label[i]] = node;
++        node->label = node->label.substr(i + 1);
++        auto next = new TrieNode(str.substr(i + 1), bf);
++        prev->children[(size_t) str[i]] = next;
++        if (node_loc)
++          *node_loc = prev;
++        if (root == node)
++          root = prev;
++      }
++    }
++    return root;
++  };
++
++  auto findBFs = [](TrieNode* root, std::string str) -> std::vector<BinaryFunction*> {
++    size_t i = 0;
++    auto node = root;
++    while (i < str.size()) {
++      if (str[i] != node->label[i] || i >= node->label.size()) {
++        auto next = node->children[(size_t) str[i]];
++        if (next == nullptr)
++          break;
++        node = next;
++        str = str.substr(i + 1);
++        i = 0;
++      } else {
++        i++;
++      }
++    }
++    std::vector<BinaryFunction*> bfs;
++    std::vector<TrieNode*> s = {node};
++    while (s.size() > 0) {
++      auto n = s.back();
++      s.pop_back();
++      for (int i = 0; i < 128; i++)
++        if (n->children[i] != nullptr)
++          s.push_back(n->children[i]);
++      if (n->bf) bfs.push_back(n->bf);
++    }
++
++    return bfs;
++  };
++  */
++
++  size_t MatchedUnrecognizedOnly = 0;
++
++  StringMap<std::vector<std::string>> NewFileFuncMap;
++  for (auto &[Func, Loc]: readFuncLocs(opts::NewDebugInfoFileName)) {
++    NewFileFuncMap[Loc.first].push_back(Func);
++  }
++
++  StringMap<std::vector<std::string>> OldFuncFileMap;
++  for (auto &[Func, Loc]: readFuncLocs(opts::OldDebugInfoFileName)) {
++    OldFuncFileMap[Loc.first].push_back(Func);
++  }
++
++  StringMap<std::vector<BinaryFunction *>> NewFuncBFMap;
++  for (auto *BF: BC.getAllBinaryFunctions()) {
++    if (ProfiledFunctions.count(BF))
++      continue;
++    for (auto &BFName: BF->getNames())
++      NewFuncBFMap[NameResolver::restore(BFName)].push_back(BF);
++  }
++  for (auto &YamlBF: YamlBP.Functions) {
++    if (YamlBF.Used) {
++      continue;
++    }
++    auto YamlBFName = NameResolver::restore(YamlBF.Name);
++    auto YamlBFDemangledName = demangle(YamlBFName);
++    BinaryFunction *ClosestNameBF = nullptr;
++
++    unsigned MinEditDistance = UINT_MAX;
++    for (auto &File: OldFuncFileMap[YamlBFName]) {
++      for (auto NewFunc: NewFileFuncMap[File]) {
++        for (auto NewBF: NewFuncBFMap[NewFunc]) {
++          if (ProfiledFunctions.count(NewBF))
++            continue;
++          auto BFDemangledName = NewBF->getDemangledName();
++          if (YamlBFDemangledName.back() != ')') {
++            size_t pos = BFDemangledName.find('(');
++            if (pos != std::string::npos)
++              BFDemangledName = BFDemangledName.substr(0, pos);
++          }
++          unsigned BFEditDistance =
++            StringRef(BFDemangledName).edit_distance(YamlBFDemangledName);
++          if (BFEditDistance < MinEditDistance) {
++            MinEditDistance = BFEditDistance;
++            ClosestNameBF = NewBF;
++          }
++        }
++      }
++    }
++
++    if (ClosestNameBF) {
++      outs() << "Tawhid-Map-Custom: " << YamlBF.Name << ' ' << ClosestNameBF->getPrintName() << '\n';
++      matchProfileToFunction(YamlBF, *ClosestNameBF);
++      ++MatchedUnrecognizedOnly;
++    }
++    // if (ClosestNameBF) outs() << "Tawhid-Map$" << YamlBFDemangledName << '$' << ClosestNameBF->getDemangledName() << '\n';
++    // else outs() << "Tawhid-Map$" << YamlBFDemangledName << '$' << "0" << '\n';
++  }
++
++  return MatchedUnrecognizedOnly;
++}
++
++#ifndef ADD_PATH
++size_t YAMLProfileReader::matchUnrecognizedOnly_v2(BinaryContext &BC) {
++  if (opts::OldDebugInfoFileName.size() == 0)
++    return 0;
++  
++  auto Demangle = [](const std::string FunctionName) {
++    auto Pos = FunctionName.find_first_of('.');
++    auto MangledName = FunctionName.substr(0, Pos);
++    auto Ext = (Pos == std::string::npos)? "": FunctionName.substr(Pos + 1);
++
++    ItaniumPartialDemangler Demangler;
++    if (Demangler.partialDemangle(MangledName.data()))
++      return std::tuple(std::string(), MangledName, std::string(), Ext);
++    auto [Context, Name, Params] = Demangler.getFunctionContextNameParameters();
++    if (Name.length() == 0)
++      return std::tuple(std::string(), MangledName, std::string(), Ext);
++    return std::tuple(Context, Name, Params, Ext);
++  };
++
++  auto CalcDistance = [](const std::string &New, const std::string &Old) {
++    auto MaxLen = std::max(New.length(), Old.length());
++    if (MaxLen == 0)
++      return 0.0;
++    return (double) StringRef(New).edit_distance(Old) / (double) MaxLen;
++  };
++
++  auto CalcExtDistance = [](const std::string& Ext1, const std::string& Ext2) {
++    int StrDist = 0, NumDist = 0;
++    std::stringstream SS1(Ext1);
++    std::stringstream SS2(Ext2);
++    std::string Token1, Token2;
++
++    // Function to check if a string is a valid integer
++    auto ToNum = [](const std::string& str) {
++      int Num = 0;
++      if (str.empty()) return -1;
++      for (size_t i = 0; i < str.size(); ++i) {
++          if (!std::isdigit(str[i])) {
++              return -1;  // Not a valid integer
++          }
++          Num = Num * 10 + str[i] - '0';
++      }
++      return Num;
++    };
++
++    // Compare parts of the strings
++    while (std::getline(SS1, Token1, '.') && std::getline(SS2, Token2, '.')) {
++      auto Num1 = ToNum(Token1);
++      auto Num2 = ToNum(Token2);
++      if (Num1 >= 0 && Num2 >= 0) {
++          NumDist = NumDist * 100 + std::abs(Num1 - Num2);
++      } else if (Token1 != Token2) {
++        StrDist += 2;
++      }
++    }
++
++    // If one string is longer than the other, notify about unmatched parts
++    if (SS1.fail()) {
++      while (std::getline(SS2, Token2, '.')) {
++        auto Num = ToNum(Token2);
++        if (Num >= 0) NumDist = NumDist * 100 + Num;
++        else StrDist += 1;
++      }
++    } else {
++      auto Num = ToNum(Token1);
++      if (Num >= 0) NumDist = NumDist * 100 + Num;
++      else StrDist += 1;
++      while (std::getline(SS1, Token1, '.')) {
++        auto Num = ToNum(Token1);
++        if (Num >= 0) NumDist = NumDist * 100 + Num;
++        else StrDist += 1;
++      }
++    }
++
++    return StrDist + ((double) NumDist) * 1e-12;
++  };
++
++
++  size_t MatchedUnrecognizedOnly = 0;
++
++  StringMap<std::vector<std::string>> OldFuncFilesMap;
++  for (auto &[Func, Loc]: readFuncLocs(opts::OldDebugInfoFileName)) {
++    OldFuncFilesMap[Func].push_back(Loc.first.substr(0, Loc.first.find_last_of(".")));
++  }
++
++  StringMap<std::vector<yaml::bolt::BinaryFunctionProfile*>> OldFileBFsMap;
++  StringMap<std::tuple<std::string, std::string, std::string, std::string>> OldFuncDemangleMap;
++  for (auto &YamlBF: YamlBP.Functions) {
++    if (YamlBF.Used)
++      continue;
++    auto OldRestoredName = NameResolver::restore(YamlBF.Name);
++    OldFuncDemangleMap[OldRestoredName] = Demangle(OldRestoredName.str());
++    for (auto &OldFile: OldFuncFilesMap[OldRestoredName])
++      OldFileBFsMap[OldFile].push_back(&YamlBF);
++  }
++
++  StringMap<std::vector<std::string>> NewFuncFilesMap;
++  for (auto &[Func, Loc]: readFuncLocs(opts::NewDebugInfoFileName)) {
++    NewFuncFilesMap[Func].push_back(Loc.first.substr(0, Loc.first.find_last_of(".")));
++  }
++  using Key = std::pair<yaml::bolt::BinaryFunctionProfile*, BinaryFunction*>;
++  using Val = std::tuple<double, double, double>;
++  DenseMap<Key, Val> Distance;
++  for (auto BF: BC.getAllBinaryFunctions()) {
++    if (ProfiledFunctions.count(BF))
++      continue;
++    for (auto &BFName: BF->getNames()) {
++      auto NewRestoredName = NameResolver::restore(BFName);
++      auto [NewContext, NewName, NewParams, NewExt] = Demangle(NewRestoredName.str());
++      for (auto &File: NewFuncFilesMap[NewRestoredName]) {
++        for (auto YamlBF: OldFileBFsMap[File]) {
++          auto &[OldContext, OldName, OldParams, OldExt] = OldFuncDemangleMap[NameResolver::restore(YamlBF->Name)];
++          Key K = {YamlBF, BF};
++          auto NameDist = (CalcDistance(NewContext, OldContext) + CalcDistance(NewName, OldName)) / 2;
++          auto ParamsDist = CalcDistance(NewParams, OldParams);
++          if (NameDist > 0.5) {
++            NameDist = 1;
++            ParamsDist = (ParamsDist + NameDist) / 2;
++          }
++          Val V = {NameDist, ParamsDist, CalcExtDistance(NewExt, OldExt)};
++          if (Distance.count(K) == 0 || Distance[K] > V)
++            Distance[K] = V;
++          // outs() << "Tawhid-Dist: " << YamlBF->Name << ' ' << BFName << ' ' << BFEditDistance << ' '
++          // << YamlBFDemangledName << ' ' << BFDemangledName << '\n';
++        }
++      }
++    }
++  }
++
++  using Tuple = std::pair<Key, Val>;
++  struct CompareTuple {
++    bool operator()(const Tuple& a, const Tuple& b) {
++      return std::get<1>(a) > std::get<1>(b);
++    }
++  };
++  std::priority_queue<Tuple, std::vector<Tuple>, CompareTuple> MinHeap(Distance.begin(), Distance.end());
++  
++  auto NumMatches = YamlBP.Functions.size();
++  while (MinHeap.size() && NumMatches) {
++    auto &[YamlBF, BF] = MinHeap.top().first;
++    if (YamlBF->Used || ProfiledFunctions.count(BF)) {
++      MinHeap.pop();
++      continue;
++    }
++    outs() << "Tawhid-Map-Custom: " << YamlBF->Name << ' ' << BF->getPrintName() << '\n';
++    matchProfileToFunction(*YamlBF, *BF);
++    ++MatchedUnrecognizedOnly;
++    NumMatches--;
++    MinHeap.pop();
++  }
++
++  return MatchedUnrecognizedOnly;
++}
++
++#else
++// Tawhid: Adding Path (and an algorithmic change)
++size_t YAMLProfileReader::matchUnrecognizedOnly_v2(BinaryContext &BC) {
++  if (opts::OldDebugInfoFileName.size() == 0)
++    return 0;
++
++  size_t MatchedUnrecognizedOnly = 0;
++  ItaniumPartialDemangler Demangler;
++
++  // Demangle and derive namespace from function name.
++  auto DemangleName = [&](std::string &FunctionName) {
++    StringRef RestoredName = NameResolver::restore(FunctionName);
++    return demangle(RestoredName);
++  };
++
++  StringMap<std::vector<yaml::bolt::BinaryFunctionProfile*>> OldFileBFsMap;
++  for (auto &YamlBF: YamlBP.Functions) {
++    if (YamlBF.Used) {
++      continue;
++    }
++    auto OldFile = YamlBF.Path.substr(YamlBF.Path.find_last_of("/\\") + 1);
++    OldFileBFsMap[OldFile].push_back(&YamlBF);
++  }
++
++  StringMap<std::vector<BinaryFunction*>> NewFileBFsMap;
++  for (auto BF: BC.getAllBinaryFunctions()) {
++    if (ProfiledFunctions.count(BF))
++      continue;
++    auto NewFile = BF->getFileName(llvm::DILineInfoSpecifier::FileLineInfoKind::BaseNameOnly);
++    if (!OldFileBFsMap.count(NewFile))
++      continue;
++    NewFileBFsMap[NewFile].push_back(BF);
++  }
++
++  using Tuple = std::tuple<std::pair<int, int>, yaml::bolt::BinaryFunctionProfile*, BinaryFunction*>;
++  struct CompareTuple {
++    bool operator()(const Tuple& a, const Tuple& b) {
++      return std::get<0>(a) > std::get<0>(b);
++    }
++  };
++  for (auto &[File, YamlBFs]: OldFileBFsMap) {
++    std::priority_queue<Tuple, std::vector<Tuple>, CompareTuple> MinHeap;
++    for (auto YamlBF: YamlBFs) {
++      auto YamlBFDemangledName = DemangleName(YamlBF->Name);
++      for (auto BF: NewFileBFsMap[File]) {
++        auto BFDemangledName = BF->getDemangledName();
++        if (YamlBFDemangledName.back() != ')') {
++          size_t pos = BFDemangledName.find('(');
++          if (pos != std::string::npos)
++            BFDemangledName = BFDemangledName.substr(0, pos);
++        }
++        unsigned BFEditDistance =
++          StringRef(BFDemangledName).edit_distance(YamlBFDemangledName);
++        MinHeap.push(std::make_tuple(
++          std::make_pair(
++            BFEditDistance, 
++            2 * BFEditDistance - YamlBFDemangledName.size() - BFDemangledName.size()
++          ), YamlBF, BF
++        ));
++      }
++    }
++    auto NumMatches = std::min(YamlBFs.size(), NewFileBFsMap[File].size());
++    while (MinHeap.size() && NumMatches) {
++      auto &[_, YamlBF, BF] = MinHeap.top();
++      if (YamlBF->Used || ProfiledFunctions.count(BF)) {
++        MinHeap.pop();
++        continue;
++      }
++      outs() << "Tawhid-Map-Custom: " << YamlBF->Name << ' ' << BF->getPrintName() << '\n';
++      matchProfileToFunction(*YamlBF, *BF);
++      ++MatchedUnrecognizedOnly;
++      NumMatches--;
++      MinHeap.pop();
++    }
++  }
++
++  return MatchedUnrecognizedOnly;
++}
++#endif
++
++void YAMLProfileReader::readBBMaps(std::string FileName) {
++  // Open the file
++  std::ifstream File(FileName, std::ios::in);
++  if (!File.is_open()) {
++    outs() << "Error: Could not open the file " << FileName << '\n';
++    return;
++  }
++
++  // Read the file line by line
++  std::string Line;
++  while (std::getline(File, Line)) {
++    std::stringstream SS(Line);
++    std::string YamlBFName;
++    int YamlBBIndex, BinaryBBIndex;
++    char Comma;
++    
++    if (std::getline(SS, YamlBFName, ',') && 
++      SS >> YamlBBIndex >> Comma && 
++      SS >> BinaryBBIndex) {
++      BBMaps[YamlBFName][YamlBBIndex] = BinaryBBIndex;
++    } else {
++      outs() << "Error: Could not parse line " << Line << '\n';
++    }
++  }
++
++  // Close the file
++  File.close();
++}
++
++void YAMLProfileReader::readBFCrossMaps(std::string FileName, BinaryContext &BC) {
++  // Open the file
++  std::ifstream File(FileName, std::ios::in);
++  if (!File.is_open()) {
++    outs() << "Error: Could not open the file " << FileName << '\n';
++    return;
++  }
++
++  StringMap<BinaryFunction *> NameToBF;
++  for (auto BF: BC.getAllBinaryFunctions()) {
++    for (auto Name: BF->getNames()) {
++      NameToBF[Name] = BF;
++    }
++  }
++
++  StringMap<yaml::bolt::BinaryFunctionProfile *> NameToYamlBF;
++  for (auto &YamlBF: YamlBP.Functions) {
++    NameToYamlBF[YamlBF.Name] = &YamlBF;
++  }
++
++  // Read the file line by line
++  std::string Line;
++  while (std::getline(File, Line)) {
++    std::stringstream SS(Line);
++    std::string BinaryBFName, YamlBFName;
++    int BinaryBBIndex, YamlBBIndex;
++    char Comma;
++    
++    if (std::getline(SS, BinaryBFName, ',') && 
++        SS >> BinaryBBIndex >> Comma && 
++        std::getline(SS, YamlBFName, ',') && 
++        SS >> YamlBBIndex &&
++        NameToBF.contains(BinaryBFName) &&
++        NameToYamlBF.contains(YamlBFName)
++      ) {
++      BFCrossMaps[NameToBF[BinaryBFName]].push_back({BinaryBBIndex, NameToYamlBF[YamlBFName], YamlBBIndex});
++      BBMaps[YamlBFName][YamlBBIndex] = -1;
++    } else {
++      outs() << "Error: Could not parse line " << Line << '\n';
++    }
++  }
++
++  // Close the file
++  File.close();
++}
++
+ Error YAMLProfileReader::readProfile(BinaryContext &BC) {
+   if (opts::Verbosity >= 1) {
+     outs() << "BOLT-INFO: YAML profile with hash: ";
+@@ -840,9 +1488,17 @@ Error YAMLProfileReader::readProfile(BinaryContext &BC) {
+   [[maybe_unused]] const size_t MatchedWithPseudoProbes =
+       matchWithPseudoProbes(BC);
+ 
+-  for (auto [YamlBF, BF] : llvm::zip_equal(YamlBP.Functions, ProfileBFs))
+-    if (!YamlBF.Used && BF && !ProfiledFunctions.count(BF))
++  for (auto [YamlBF, BF] : llvm::zip_equal(YamlBP.Functions, ProfileBFs)) {
++    if (!YamlBF.Used && BF && !ProfiledFunctions.count(BF)) {
++      outs() << "Tawhid-Map-Forced: " << YamlBF.Name << ' ' << BF->getPrintName() << '\n';
+       matchProfileToFunction(YamlBF, *BF);
++    }
++  }
++
++  if (opts::SortedMatchUnrecognized)
++    matchUnrecognizedOnly_v2(BC);
++  else
++    matchUnrecognizedOnly(BC);
+ 
+ 
+   for (yaml::bolt::BinaryFunctionProfile &YamlBF : YamlBP.Functions)
+@@ -850,7 +1506,7 @@ Error YAMLProfileReader::readProfile(BinaryContext &BC) {
+       errs() << "BOLT-WARNING: profile ignored for function " << YamlBF.Name
+              << '\n';
+ 
+-  if (opts::Verbosity >= 1) {
++  //if (opts::Verbosity >= 1) {
+     outs() << "BOLT-INFO: matched " << MatchedWithExactName
+            << " functions with identical names\n";
+     outs() << "BOLT-INFO: matched " << MatchedWithHash
+@@ -861,7 +1517,13 @@ Error YAMLProfileReader::readProfile(BinaryContext &BC) {
+            << " functions with call graph\n";
+     outs() << "BOLT-INFO: matched " << MatchedWithNameSimilarity
+            << " functions with similar names\n";
+-  }
++  //}
++
++  if (opts::BBMapFileName.size() > 0)
++    readBBMaps(opts::BBMapFileName);
++
++  if (opts::BFCrossMapFileName.size() > 0)
++    readBFCrossMaps(opts::BFCrossMapFileName, BC);
+ 
+   // Set for parseFunctionProfile().
+   NormalizeByInsnCount = usesEvent("cycles") || usesEvent("instructions");
+@@ -870,19 +1532,99 @@ Error YAMLProfileReader::readProfile(BinaryContext &BC) {
+   for (yaml::bolt::BinaryFunctionProfile &YamlBF : YamlBP.Functions) {
+     if (BinaryFunction *BF = YamlProfileToFunction.lookup(YamlBF.Id))
+       parseFunctionProfile(*BF, YamlBF);
+-    else
++    else {
+       ++NumUnused;
++      // BC.outs() << "Tawhid-Info: " << "unused-execcount " << YamlBF.ExecCount << "\n";
++    }
+   }
+ 
++  BBMaps.clear();
++  BFCrossMaps.clear();
++
+   BC.setNumUnusedProfiledObjects(NumUnused);
+ 
+   if (opts::Lite &&
+-      (opts::MatchProfileWithFunctionHash || opts::MatchWithCallGraph)) {
++      (opts::MatchProfileWithFunctionHash || opts::MatchWithCallGraph || opts::IgnoreMissingprofile)) {
+     for (BinaryFunction *BF : BC.getAllBinaryFunctions())
+       if (!BF->hasProfile())
+         BF->setIgnored();
+   }
+ 
++  if (!opts::PrintInfo)
++    return Error::success();
++  
++  auto Demangle = [](const llvm::StringRef &FunctionName) {
++    auto RestoredFunctionName = NameResolver::restore(FunctionName).str();
++    auto Pos = std::min(
++        RestoredFunctionName.find_first_of('.'),
++        RestoredFunctionName.find_first_of('@')
++    );
++    auto MangledName = RestoredFunctionName.substr(0, Pos);
++    auto Ext = (Pos == std::string::npos)? "": RestoredFunctionName.substr(Pos + 1);
++
++    ItaniumPartialDemangler Demangler;
++    if (Demangler.partialDemangle(MangledName.data()))
++      return std::tuple(std::string(), MangledName, std::string(), Ext);
++    auto [Context, Name, Params] = Demangler.getFunctionContextNameParameters();
++    if (Name.length() == 0)
++      return std::tuple(std::string(), MangledName, std::string(), Ext);
++    return std::tuple(Context, Name, Params, Ext);
++  };
++
++  for (auto BF: BC.getAllBinaryFunctions()) {
++    auto LineInfo = BC.DwCtx->getLineInfoForAddress(
++      {BF->getAddress(), BF->getOriginSection()->getAddress()}, 
++      DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath
++    );
++    auto Id = BF->getFunctionNumber();
++    auto Hash = BF->getHash();
++    auto NumBasicBlocks = BF->getLayout().block_size();
++    for (const auto& BFName: BF->getNames()) {
++      auto [Context, Name, Params, Ext] = Demangle(BFName);
++      outs() << "Tawhid-LineInfo#"
++      << BFName << '#'
++      << Context << '#'
++      << Name << '#'
++      << Params << '#'
++      << Ext << '#'
++      << LineInfo.FileName << '#'
++      << LineInfo.Line << '#'
++      << LineInfo.Column << '#'
++      << Id << '#' 
++      << Hash << '#' 
++      << NumBasicBlocks << '\n';
++    }
++  }
++  
++  for (auto BF : BC.getSortedFunctions()) {
++    outs() << "Tawhid-Counts: func ";
++    for (auto BFName: BF->getNames())
++      outs() << BFName << ','; 
++    outs() << ' ';
++    outs() << BF->getExecutionCount() << ' ' 
++    << BF->getAddress() << ' '
++    << BF->hasProfile() << ' ' 
++    << BF->isIgnored() << '\n';
++    BF->computeBlockHashes(YamlBP.Header.HashFunction);
++    for (auto SrcBB: BF->getLayout().blocks()) {
++      auto BI = SrcBB->branch_info_begin();
++      outs() << "Tawhid-Counts: node " 
++      << BF->getAddress() << '#' << SrcBB->getIndex() << ' ' 
++      << SrcBB->getExecutionCount() << ' '
++      << SrcBB->getOffset() << ' '
++      << SrcBB->getEndOffset() << ' '
++      << SrcBB->getHash() << ' '
++      << SrcBB->getNumNonPseudos() << '\n';
++      for (auto DstBB: SrcBB->successors()) {
++        outs() << "Tawhid-Counts: edge " 
++        << BF->getAddress() << '#' << SrcBB->getIndex() << ' ' 
++        << DstBB->getFunction()->getAddress() << '#' << DstBB->getIndex() << ' ' 
++        << BI->Count << '\n';
++        ++BI;
++      }
++    }
++  }
++
+   return Error::success();
+ }
+ 
+diff --git a/bolt/lib/Profile/YAMLProfileWriter.cpp b/bolt/lib/Profile/YAMLProfileWriter.cpp
+index e39485816356..541a9f208523 100644
+--- a/bolt/lib/Profile/YAMLProfileWriter.cpp
++++ b/bolt/lib/Profile/YAMLProfileWriter.cpp
+@@ -225,6 +225,9 @@ YAMLProfileWriter::convert(const BinaryFunction &BF, bool UseDFS,
+   BF.computeBlockHashes();
+ 
+   YamlBF.Name = DataAggregator::getLocationName(BF, BAT);
++  #ifdef ADD_PATH
++  YamlBF.Path = BF.getFileName(llvm::DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath); // Tawhid: Adding Path
++  #endif
+   YamlBF.Id = BF.getFunctionNumber();
+   YamlBF.Hash = BF.getHash();
+   YamlBF.NumBasicBlocks = BF.size();
+diff --git a/bolt/lib/Rewrite/RewriteInstance.cpp b/bolt/lib/Rewrite/RewriteInstance.cpp
+index 1fcf2bb959bb..775e3f17547e 100644
+--- a/bolt/lib/Rewrite/RewriteInstance.cpp
++++ b/bolt/lib/Rewrite/RewriteInstance.cpp
+@@ -86,6 +86,7 @@ extern cl::opt<bolt::ReorderFunctions::ReorderType> ReorderFunctions;
+ extern cl::opt<bool> TerminalTrap;
+ extern cl::opt<bool> TimeBuild;
+ extern cl::opt<bool> TimeRewrite;
++extern cl::opt<bool> PrintNess;
+ 
+ cl::opt<bool> AllowStripped("allow-stripped",
+                             cl::desc("allow processing of stripped binaries"),
+@@ -685,6 +686,19 @@ Error RewriteInstance::run() {
+ 
+   buildFunctionsCFG();
+ 
++  // for (const std::unique_ptr<DWARFUnit> &CU : BC->DwCtx->compile_units()) {
++  //   auto LineTable = BC->DwCtx->getLineTableForUnit(CU.get());
++  //   for (auto f: LineTable->Prologue.FileNames) outs() << "Tawhid-File: " << dwarf::toString(f.Name) << '\n';
++  // }
++
++  // for (auto BF: BC->getAllBinaryFunctions()) {
++  //   outs() << "Tawhid-FileFuncs: " 
++  //   << BF->getFileName(DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath) << ':' 
++  //   << BF->getFileOffset() << ' ';
++  //   for (auto &BFName: BF->getNames()) outs() << BFName << ',';
++  //   outs() << '\n';
++  // }
++
+   processProfileData();
+ 
+   // Save input binary metadata if BAT section needs to be emitted
+@@ -702,6 +716,22 @@ Error RewriteInstance::run() {
+ 
+   runOptimizationPasses();
+ 
++  if (opts::PrintNess) for (auto BF: BC->getAllBinaryFunctions()) {
++    outs() << "Tawhid-Ness: ";
++    for (auto BFName: BF->getNames())
++      outs() << BFName << ',';
++    outs() << ' ' << BF->hasProfile() << ' '
++           << BF->getKnownExecutionCount() << ' ';
++    for (auto BB: BF->getLayout().blocks()) {
++      outs()
++      << BB->getIndex() << '#'
++      << BB->isCold() << '#'
++      << BB->hasProfile() << '#'
++      << BB->getKnownExecutionCount() << ' ';
++    }
++    outs() << '\n';
++  }
++
+   finalizeMetadataPreEmit();
+ 
+   emitAndLink();
+@@ -3402,6 +3432,9 @@ void RewriteInstance::buildFunctionsCFG() {
+       SkipPredicate, "disassembleFunctions-buildCFG",
+       /*ForceSequential*/ opts::SequentialDisassembly || opts::PrintAll);
+ 
++  // for (auto BF: BC->getAllBinaryFunctions())
++  //   if (BF) outs() << "Tawhid-Test: " << BF->getDemangledName() << ' ' << BF->size() << ' ' << BF->hasCFG() << ' ' << BF->isPseudo() << ' ' << BF->isIgnored() << ' ' << BF->isSimple() << '\n';
++
+   BC->postProcessSymbolTable();
+ }
+ 
+diff --git a/llvm/include/llvm/Demangle/Demangle.h b/llvm/include/llvm/Demangle/Demangle.h
+index 132e5088b551..5d6462362373 100644
+--- a/llvm/include/llvm/Demangle/Demangle.h
++++ b/llvm/include/llvm/Demangle/Demangle.h
+@@ -101,6 +101,8 @@ struct ItaniumPartialDemangler {
+   /// "a::b".
+   char *getFunctionDeclContextName(char *Buf, size_t *N) const;
+ 
++  std::tuple<std::string, std::string, std::string> getFunctionContextNameParameters() const;
++
+   /// Get the entire name of this function.
+   char *getFunctionName(char *Buf, size_t *N) const;
+ 
+diff --git a/llvm/lib/Demangle/ItaniumDemangle.cpp b/llvm/lib/Demangle/ItaniumDemangle.cpp
+index 5c21b06a1d09..e507d23bdddb 100644
+--- a/llvm/lib/Demangle/ItaniumDemangle.cpp
++++ b/llvm/lib/Demangle/ItaniumDemangle.cpp
+@@ -518,6 +518,69 @@ char *ItaniumPartialDemangler::getFunctionParameters(char *Buf,
+   return OB.getBuffer();
+ }
+ 
++std::tuple<std::string, std::string, std::string> ItaniumPartialDemangler::getFunctionContextNameParameters() const {
++  if (!isFunction())
++    return {"", "", ""};
++  
++  const Node *Name = static_cast<const FunctionEncoding *>(RootNode)->getName();
++  
++  OutputBuffer OBContext;
++  std::vector<Node*> NameNodes;
++
++  KeepGoingLocalFunction:
++  while (true) {
++    if (Name->getKind() == Node::KAbiTagAttr) {
++      Name = static_cast<const AbiTagAttr *>(Name)->Base;
++      continue;
++    }
++    if (Name->getKind() == Node::KNameWithTemplateArgs) {
++      auto *NTA = static_cast<const NameWithTemplateArgs *>(Name);
++      NameNodes.push_back(NTA->TemplateArgs);
++      Name = NTA->Name;
++      continue;
++    }
++    break;
++  }
++
++  if (Name->getKind() == Node::KModuleEntity)
++    Name = static_cast<const ModuleEntity *>(Name)->Name;
++
++  switch (Name->getKind()) {
++  case Node::KNestedName: {
++    auto *NN = static_cast<const NestedName *>(Name);
++    NN->Qual->print(OBContext);
++    Name = NN->Name;
++    break;
++  }
++  case Node::KLocalName: {
++    auto *LN = static_cast<const LocalName *>(Name);
++    LN->Encoding->print(OBContext);
++    OBContext += "::";
++    Name = LN->Entity;
++    goto KeepGoingLocalFunction;
++  }
++  default:
++    break;
++  }
++  auto ContextStr = std::string(OBContext.getBuffer(), OBContext.getCurrentPosition());
++  
++  OutputBuffer OBName;
++  Name->print(OBName);
++  for (auto It = NameNodes.rbegin(); It != NameNodes.rend(); ++It) {
++    (*It)->print(OBName);
++  }
++  auto NameStr = std::string(OBName.getBuffer(), OBName.getCurrentPosition());
++
++  NodeArray Params = static_cast<FunctionEncoding *>(RootNode)->getParams();
++  OutputBuffer OBParams;
++  OBParams += '(';
++  Params.printWithComma(OBParams);
++  OBParams += ')';
++  auto ParamsStr = std::string(OBParams.getBuffer(), OBParams.getCurrentPosition());
++
++  return {ContextStr, NameStr, ParamsStr};
++}
++
+ char *ItaniumPartialDemangler::getFunctionReturnType(
+     char *Buf, size_t *N) const {
+   if (!isFunction())
