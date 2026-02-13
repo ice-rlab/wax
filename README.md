@@ -2,7 +2,7 @@
 
 <span style="font-variant:small-caps;">Wax</span>  is a novel technique for optimizing data center applications with stale profiles. Data center providers, [Google](https://dl.acm.org/doi/abs/10.1145/2854038.2854044) and [Meta](https://dl.acm.org/doi/abs/10.1145/3640537.3641573), continuously profile the current versions of data center applications and use these profiles to optimize subsequent versions. As practitioners deploy new versions every one or two weeks, source code changes rapidly between them, causing 70-92% of profile samples to become stale. <span style="font-variant:small-caps;">Wax</span> addresses this profile staleness with the key insight of using the debug and source code information. Leveraging source and debug information, <span style="font-variant:small-caps;">Wax</span> provides 6-26% performance speedups across five widely used data center applications, achieving 65-93% of the benefits of fresh profiles.
 
-Please cite the following paper if you use <span style="font-variant:small-caps;">Wax</span>'s open-source artifacts:
+Please cite the following [paper](https://takhandipu.github.io/papers/bhuiyan-wax-asplos-2026.pdf) if you use <span style="font-variant:small-caps;">Wax</span>'s open-source artifacts:
 ```
 @inproceedings{bhuiyan-wax-asplos-2026,
   title={Wax: Optimizing Data Center Applications With Stale Profile},
